@@ -192,6 +192,42 @@ def test_apply_augmented_entities_adds_occurrences() -> None:
     assert all(entity.source == "augmenter" for entity in merged)
 
 
+@pytest.mark.parametrize(
+    ("text", "suggestion", "expected_values"),
+    [
+        ("Alice met ALICE and alice.", "Alice", ["Alice", "ALICE", "alice"]),
+        ("Åsa met åsa.", "Åsa", ["Åsa", "åsa"]),
+        ("İpek met ipek.", "İpek", ["İpek", "ipek"]),
+    ],
+)
+def test_augmented_entities_preserve_source_spelling_for_replacement(
+    text: str, suggestion: str, expected_values: list[str]
+) -> None:
+    entities = apply_augmented_entities(
+        text=text,
+        entities=[],
+        augmented_output={"entities": [{"value": suggestion, "label": "first_name"}]},
+    )
+
+    assert [entity.value for entity in entities] == expected_values
+    assert all(entity.value == text[entity.start_position : entity.end_position] for entity in entities)
+    assert all(entity.source == "augmenter" for entity in entities)
+    result = apply_local_replace_strategy(
+        pd.DataFrame({COL_TEXT: [text], COL_FINAL_ENTITIES: [{"entities": [e.as_dict() for e in entities]}]}),
+        strategy=Redact(),
+    )
+    expected_text = text
+    for value in expected_values:
+        expected_text = expected_text.replace(value, "[REDACTED_FIRST_NAME]")
+    assert result[COL_REPLACED_TEXT].iloc[0] == expected_text
+    assert result[COL_REPLACEMENT_APPLICATION].iloc[0] == {
+        "targeted_span_count": len(expected_values),
+        "applied_span_count": len(expected_values),
+        "skipped_span_count": 0,
+        "skipped_span_label_counts": {},
+    }
+
+
 def test_apply_augmented_entities_filters_exclusions_before_overlap_resolution() -> None:
     text = "Alice Johnson"
     allowed = EntitySpan("first_name_0_5", "Alice", "first_name", 0, 5, 0.95, "detector")
@@ -244,6 +280,46 @@ def test_augmented_splits_full_name_into_parts() -> None:
     smiths = [e for e in merged if e.value == "Smith"]
     assert len(smiths) == 1
     assert smiths[0].start_position == 35
+
+
+@pytest.mark.parametrize(
+    ("full_name", "standalone", "expected_values", "expected_labels"),
+    [
+        ("John Smith", "JOHN | smith", ["JOHN", "smith"], ["first_name", "last_name"]),
+        (
+            "John Quinn Smith",
+            "JOHN | quinn | SMITH",
+            ["JOHN", "quinn", "SMITH"],
+            ["first_name", "middle_name", "last_name"],
+        ),
+    ],
+)
+def test_split_names_preserve_source_spelling_for_replacement(
+    full_name: str, standalone: str, expected_values: list[str], expected_labels: list[str]
+) -> None:
+    text = f"{full_name} | {standalone}"
+    entities = apply_augmented_entities(
+        text=text,
+        entities=[EntitySpan("fn", full_name, "full_name", 0, len(full_name), 1.0, "detector")],
+        augmented_output={"entities": []},
+    )
+
+    assert [entity.value for entity in entities] == [full_name, *expected_values]
+    assert [entity.label for entity in entities] == ["full_name", *expected_labels]
+    assert [entity.source for entity in entities] == ["detector", *["name_split"] * len(expected_values)]
+    result = apply_local_replace_strategy(
+        pd.DataFrame({COL_TEXT: [text], COL_FINAL_ENTITIES: [{"entities": [e.as_dict() for e in entities]}]}),
+        strategy=Redact(),
+    )
+    assert result[COL_REPLACED_TEXT].iloc[0] == " | ".join(
+        f"[REDACTED_{label.upper()}]" for label in ["full_name", *expected_labels]
+    )
+    assert result[COL_REPLACEMENT_APPLICATION].iloc[0] == {
+        "targeted_span_count": len(entities),
+        "applied_span_count": len(entities),
+        "skipped_span_count": 0,
+        "skipped_span_label_counts": {},
+    }
 
 
 def test_apply_augmented_entities_does_not_split_single_token_full_name() -> None:
